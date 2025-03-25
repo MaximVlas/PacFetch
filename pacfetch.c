@@ -989,7 +989,7 @@ void log_installation(const char *package_name, const char *install_dir, const c
         printf("Warning: Failed to write to log file %s\n", log_path);
     }
 
-    // Update packages.db (unchanged)
+    // Update packages.db
     FILE *db = fopen(db_path, "a+");
     if (db != NULL) {
         fseek(db, 0, SEEK_SET);
@@ -1100,8 +1100,6 @@ void log_removal(const char *package_name, const char *command_used) {
     free(log_dir_path);
 }
 
-
-// Fix for the upgrade_packages function to address the unused variable warning
 void upgrade_packages(int argc, char *argv[]) {
     char *log_dir_path = get_log_dir();
     if (log_dir_path == NULL) {
@@ -1219,16 +1217,21 @@ int check_if_installed(const char *package_name) {
 void help(void) {
     printf("PacFetch - A wrapper for pacman/yay with installation tracking\n\n");
     printf("Usage:\n");
-    printf("  pacfetch -S, --sync PACKAGE    Install a package\n");
-    printf("  pacfetch -R, --remove PACKAGE  Remove a package\n");
-    printf("  pacfetch -Q, --query [PACKAGE] Query installed packages or specific package history\n");
-    printf("  pacfetch -U, --upgrade [PACKAGE] Upgrade all packages or specific package\n");
-    printf("  pacfetch -D, --duration        Show package usage durations\n");
-    printf("  pacfetch -V, --vuln-scan       Scan for package vulnerabilities\n");
-    printf("  pacfetch -E, --export FILENAME Export list of tracked packages\n");
-    printf("  pacfetch -Ss, --search TERM    Search for packages\n");
-    printf("  pacfetch --check               Check for consistency between tracked and installed packages\n");
-    printf("  pacfetch -h, --help            Show this help message\n\n");
+    printf("  pacfetch [OPTION] [ARGUMENTS]\n\n");
+    printf("Options:\n");
+    printf("  -S, --sync PACKAGE           Install a package\n");
+    printf("  -R, --remove PACKAGE         Remove a package\n");
+    printf("  -Q, --query [PACKAGE]        Query all tracked packages or a specific package's history\n");
+    printf("  -U, --upgrade [PACKAGE]      Upgrade all packages or a specific package\n");
+    printf("  -D, --duration               Display how long each package has been installed\n");
+    printf("  -V, --vuln-scan              Scan for package vulnerabilities using arch-audit\n");
+    printf("  -E, --export FILENAME        Export the list of tracked packages to a file\n");
+    printf("  -B, --backup FILENAME        Backup the package list to a file\n");
+    printf("  -I, --import FILENAME        Import a package list from a file and install missing packages\n");
+    printf("  -C, --clean-orphans          Identify and optionally remove orphaned packages\n");
+    printf("  -Ss, --search TERM           Search for packages using the configured package manager\n");
+    printf("  --check                      Check for consistency between tracked and installed packages\n");
+    printf("  -h, --help                   Display this help message\n\n");
     printf("Configuration:\n");
     printf("  Edit ~/.pacfetch/config.ini to customize package manager and flags.\n\n");
     printf("Security:\n");
