@@ -16,14 +16,24 @@
 #define DB_FILE "packages.db"
 #define CONFIG_FILE "config.ini"
 #define MAX_LINE_LEN 256
+#define MAX_MANAGERS 10
 
 // Function prototypes
+
+
 typedef struct {
-    char default_package_manager[32];
-    int use_sudo;
-    char install_flags[64];
-    char remove_flags[64];
-    char upgrade_flags[64];
+    char name[32];          // e.g., "pacman", "yay"
+    char type[32];          // "official" or "aur"
+    char install_flags[64]; // e.g., "-S --needed"
+    char remove_flags[64];  // e.g., "-R"
+    char upgrade_flags[64]; // e.g., "-Syu"
+    int use_sudo;           // 1 or 0
+} PackageManagerConfig;
+
+typedef struct {
+    PackageManagerConfig managers[MAX_MANAGERS];
+    int manager_count;
+    char system_upgrade_manager[32]; // Manager for system-wide upgrades
 } PackfetchConfig;
 
 typedef struct {
@@ -36,12 +46,14 @@ typedef struct {
 int get_package_details(const char *package_name, PackageDetails *details);
 char* get_command_string(int argc, char *argv[]);
 void init_pacfetch(void);
-void log_installation(const char *package_name, const char *install_dir, const char *command_used);
-void install_package(int argc, char *argv[]);
-void remove_package(int argc, char *argv[]);
+void log_installation(const char *package_name, const char *install_dir, const char *command_used, const char *manager);
+void install_package(int argc, char *argv[], PackfetchConfig *config, const char *specified_manager);
+void remove_package(int argc, char *argv[], PackfetchConfig *config, const char *specified_manager);
+void upgrade_packages(int argc, char *argv[], PackfetchConfig *config, const char *specified_manager);
+
 void query_package(int argc, char *argv[]);
-void log_upgrade(const char *package_name, const char *command_used);
-void log_removal(const char *package_name, const char *command_used);
+void log_removal(const char *package_name, const char *command_used, const char *manager);
+void log_upgrade(const char *package_name, const char *command_used, const char *manager);
 int check_if_installed(const char *package_name);
 int validate_package_name(const char *package_name);
 char* sanitize_input(const char *input);
@@ -49,12 +61,10 @@ void export_package_list(const char *filename);
 void help(void);
 char* get_current_dir(void);
 char* get_log_dir(void);
-void upgrade_packages(int argc, char *argv[]);
 void create_dir_if_not_exists(const char *path);
 void log_system_upgrade(const char *command_used);
 void load_config(PackfetchConfig *config);
-void init_default_config(PackfetchConfig *config);
-int execute_package_manager(const char *package_manager, const char *action, const char *flags, const char *package);
+int execute_package_manager(const char *package_manager, const char *action, const char *flags, const char *package, int use_sudo);
 void backup_packages(const char *filename);
 void import_packages(const char *filename);
 void clean_orphans(void);
@@ -277,13 +287,35 @@ void vulnerability_scan(void) {
 
 int main(int argc, char *argv[]) {
     init_pacfetch();
+    PackfetchConfig config;
+    load_config(&config);
 
     if (argc < 2) {
         help();
         return 1;
     }
 
-    if (strcmp(argv[1], "-B") == 0 || strcmp(argv[1], "--backup") == 0) {
+    char *specified_manager = NULL;
+    int i = 1;
+    while (i < argc) {
+        if (strncmp(argv[i], "--manager=", 10) == 0) {
+            specified_manager = argv[i] + 10;
+            for (int j = i; j < argc - 1; j++) {
+                argv[j] = argv[j + 1];
+            }
+            argc--;
+        } else {
+            i++;
+        }
+    }
+
+    if (strcmp(argv[1], "-S") == 0 || strcmp(argv[1], "--sync") == 0) {
+        install_package(argc, argv, &config, specified_manager);
+    } else if (strcmp(argv[1], "-R") == 0 || strcmp(argv[1], "--remove") == 0) {
+        remove_package(argc, argv, &config, specified_manager);
+    } else if (strcmp(argv[1], "-U") == 0 || strcmp(argv[1], "--upgrade") == 0) {
+        upgrade_packages(argc, argv, &config, specified_manager);
+    } else if (strcmp(argv[1], "-B") == 0 || strcmp(argv[1], "--backup") == 0) {
         if (argc < 3) {
             printf("Error: No filename specified for backup\n");
             return 1;
@@ -299,14 +331,8 @@ int main(int argc, char *argv[]) {
         clean_orphans();
     } else if (strcmp(argv[1], "-Ss") == 0) {
         search_packages(argc, argv);
-    } else if (strcmp(argv[1], "-S") == 0 || strcmp(argv[1], "--sync") == 0) {
-        install_package(argc, argv);
-    } else if (strcmp(argv[1], "-R") == 0 || strcmp(argv[1], "--remove") == 0) {
-        remove_package(argc, argv);
     } else if (strcmp(argv[1], "-Q") == 0 || strcmp(argv[1], "--query") == 0) {
         query_package(argc, argv);
-    } else if (strcmp(argv[1], "-U") == 0 || strcmp(argv[1], "--upgrade") == 0) {
-        upgrade_packages(argc, argv);
     } else if (strcmp(argv[1], "-D") == 0 || strcmp(argv[1], "--duration") == 0) {
         calculate_duration();
     } else if (strcmp(argv[1], "-V") == 0 || strcmp(argv[1], "--vuln-scan") == 0) {
@@ -336,6 +362,7 @@ void init_pacfetch(void) {
     free(log_dir_path);
 }
 
+#if 0
 void init_default_config(PackfetchConfig *config) {
     strcpy(config->default_package_manager, "pacman");
     config->use_sudo = 1;
@@ -343,76 +370,117 @@ void init_default_config(PackfetchConfig *config) {
     strcpy(config->remove_flags, "-R");
     strcpy(config->upgrade_flags, "-Syu");
 }
+#endif
 
-void install_package(int argc, char *argv[]) {
+void install_package(int argc, char *argv[], PackfetchConfig *config, const char *specified_manager) {
     if (argc < 3) {
-        printf("Error: No package specified for installation\n");
+        printf("Error: No package specified\n");
         return;
     }
-    
-    if (!validate_package_name(argv[2])) {
-        printf("Error: Invalid package name '%s'\n", argv[2]);
+    char *package_name = argv[2];
+    if (!validate_package_name(package_name)) {
+        printf("Error: Invalid package name '%s'\n", package_name);
         return;
     }
-    
-    // Check if package is already installed
-    if (check_if_installed(argv[2])) {
-        printf("Package %s is already tracked by PacFetch.\n", argv[2]);
-        printf("Use 'pacfetch -U %s' to upgrade instead.\n", argv[2]);
-        
-        char query_cmd[MAX_CMD_LEN];
-        snprintf(query_cmd, MAX_CMD_LEN, "pacman -Q %s >/dev/null 2>&1", argv[2]);
-        if (system(query_cmd) == 0) {
-            printf("Package is already installed according to pacman.\n");
-            return;
-        } else {
-            printf("Warning: Package is tracked but not found by pacman.\n");
-            printf("Proceeding with installation anyway...\n");
+    if (check_if_installed(package_name)) {
+        printf("Package %s already tracked. Use -U to upgrade.\n", package_name);
+        return;
+    }
+
+    char *manager_to_use = NULL;
+    if (specified_manager) {
+        for (int i = 0; i < config->manager_count; i++) {
+            if (strcmp(config->managers[i].name, specified_manager) == 0) {
+                manager_to_use = config->managers[i].name;
+                break;
+            }
         }
-    }
-    
-    // Load configuration
-    PackfetchConfig config;
-    load_config(&config);
-    
-    // Try installing with the default package manager first
-    printf("Attempting to install %s with %s...\n", argv[2], config.default_package_manager);
-    int result = execute_package_manager(config.default_package_manager, "install", 
-                                       config.install_flags, argv[2]);
-    
-    // If default fails, try with alternative (yay for AUR)
-    if (result != 0) {
-        printf("Package not found in %s repositories, trying yay...\n", config.default_package_manager);
-        result = execute_package_manager("yay", "install", config.install_flags, argv[2]);
-        
-        if (result != 0) {
-            printf("Installation failed with both %s and yay.\n", config.default_package_manager);
+        if (!manager_to_use) {
+            printf("Error: Manager '%s' not configured\n", specified_manager);
             return;
         }
     }
 
-    long long size = estimate_package_size(argv[2]);
-    if (size >= 0) {
-        printf("Estimated size for %s: %lld bytes\n", argv[2], size);
-    }
-
-    // Log the successful installation
-    char *current_dir = get_current_dir();
-    if (current_dir == NULL) {
-        printf("Error: Failed to get current directory\n");
-        return;
-    }
-    
-    char *command_str = get_command_string(argc, argv);
-    if (command_str != NULL) {
-        log_installation(argv[2], current_dir, command_str);
-        free(command_str);
+    int result = -1;
+    if (manager_to_use) {
+        for (int i = 0; i < config->manager_count; i++) {
+            if (strcmp(config->managers[i].name, manager_to_use) == 0) {
+                result = execute_package_manager(manager_to_use, "install",
+                                                 config->managers[i].install_flags,
+                                                 package_name, config->managers[i].use_sudo);
+                break;
+            }
+        }
     } else {
-        log_installation(argv[2], current_dir, "unknown command");
+        for (int i = 0; i < config->manager_count; i++) {
+            if (strcmp(config->managers[i].type, "official") == 0) {
+                result = execute_package_manager(config->managers[i].name, "install",
+                                                 config->managers[i].install_flags,
+                                                 package_name, config->managers[i].use_sudo);
+                if (result == 0) {
+                    manager_to_use = config->managers[i].name;
+                    break;
+                }
+            }
+        }
+        if (result != 0) {
+            for (int i = 0; i < config->manager_count; i++) {
+                if (strcmp(config->managers[i].type, "aur") == 0) {
+                    result = execute_package_manager(config->managers[i].name, "install",
+                                                     config->managers[i].install_flags,
+                                                     package_name, config->managers[i].use_sudo);
+                    if (result == 0) {
+                        manager_to_use = config->managers[i].name;
+                        break;
+                    }
+                }
+            }
+        }
     }
-    free(current_dir);
-    
-    printf("Installation of %s completed and logged.\n", argv[2]);
+
+    if (result != 0) {
+        printf("Failed to install %s with any manager\n", package_name);
+        return;
+    }
+
+    char *current_dir = get_current_dir();
+    char *command_str = get_command_string(argc, argv);
+    log_installation(package_name, current_dir, command_str, manager_to_use);
+    if (current_dir) free(current_dir);
+    if (command_str) free(command_str);
+    printf("Installed %s with %s\n", package_name, manager_to_use);
+}
+
+char* get_installation_manager(const char *package_name) {
+    char *log_dir_path = get_log_dir();
+    if (!log_dir_path) return NULL;
+    char db_path[MAX_PATH_LEN];
+    snprintf(db_path, MAX_PATH_LEN, "%s/%s", log_dir_path, DB_FILE);
+    FILE *db = fopen(db_path, "r");
+    if (!db) {
+        free(log_dir_path);
+        return NULL;
+    }
+    char line[MAX_CMD_LEN];
+    while (fgets(line, MAX_CMD_LEN, db)) {
+        char *fields[10];
+        int field_count = 0;
+        char *token = strtok(line, ",");
+        while (token && field_count < 10) {
+            fields[field_count++] = token;
+            token = strtok(NULL, ",");
+        }
+        if (field_count >= 4 && strcmp(fields[0], package_name) == 0) {
+            char *manager = fields[3];
+            char *result = strdup(manager);
+            fclose(db);
+            free(log_dir_path);
+            return result;
+        }
+    }
+    fclose(db);
+    free(log_dir_path);
+    return NULL;
 }
 
 void clean_orphans(void) {
@@ -468,11 +536,26 @@ void import_packages(const char *filename) {
     char line[MAX_CMD_LEN];
     PackfetchConfig config;
     load_config(&config);
+    
+    // Find the system upgrade manager's config
+    PackageManagerConfig *mgr = NULL;
+    for (int i = 0; i < config.manager_count; i++) {
+        if (strcmp(config.managers[i].name, config.system_upgrade_manager) == 0) {
+            mgr = &config.managers[i];
+            break;
+        }
+    }
+    if (mgr == NULL) {
+        printf("Error: System upgrade manager '%s' not found\n", config.system_upgrade_manager);
+        fclose(file);
+        return;
+    }
+    
     while (fgets(line, MAX_CMD_LEN, file) != NULL) {
         if (line[0] == '#') continue;  // Skip comments
         char *pkg_name = strtok(line, ",");
         if (pkg_name && !check_if_installed(pkg_name)) {
-            execute_package_manager(config.default_package_manager, "install", config.install_flags, pkg_name);
+            execute_package_manager(mgr->name, "install", mgr->install_flags, pkg_name, mgr->use_sudo);
         }
     }
     fclose(file);
@@ -519,7 +602,7 @@ void export_package_list(const char *filename) {
     printf("Export completed successfully to %s\n", filename);
 }
 
-int execute_package_manager(const char *package_manager, const char *action, const char *flags, const char *package) {
+int execute_package_manager(const char *package_manager, const char *action, const char *flags, const char *package, int use_sudo) {
     if (!validate_package_name(package)) {
         printf("Error: Invalid package name\n");
         return -1;
@@ -533,21 +616,13 @@ int execute_package_manager(const char *package_manager, const char *action, con
     
     char cmd[MAX_CMD_LEN];
     
-    // Load configuration
-    PackfetchConfig config;
-    load_config(&config);
-    
-    // Use action for logging purposes
     printf("Performing %s action on package %s using %s...\n", 
            action, sanitized_package, package_manager);
     
-    // Build command with or without sudo
-    if (config.use_sudo) {
-        snprintf(cmd, MAX_CMD_LEN, "sudo %s %s %s", 
-                 package_manager, flags, sanitized_package);
+    if (use_sudo) {
+        snprintf(cmd, MAX_CMD_LEN, "sudo %s %s %s", package_manager, flags, sanitized_package);
     } else {
-        snprintf(cmd, MAX_CMD_LEN, "%s %s %s", 
-                 package_manager, flags, sanitized_package);
+        snprintf(cmd, MAX_CMD_LEN, "%s %s %s", package_manager, flags, sanitized_package);
     }
     
     printf("Executing: %s\n", cmd);
@@ -558,72 +633,76 @@ int execute_package_manager(const char *package_manager, const char *action, con
 }
 
 void load_config(PackfetchConfig *config) {
-    // Set defaults first
-    init_default_config(config);
-    
+    config->manager_count = 0;
+    strcpy(config->system_upgrade_manager, "");
+
     char *log_dir_path = get_log_dir();
-    if (log_dir_path == NULL) {
-        printf("Warning: Failed to get log directory, using default configuration\n");
-        return;
-    }
-    
     char config_path[MAX_PATH_LEN];
     snprintf(config_path, MAX_PATH_LEN, "%s/%s", log_dir_path, CONFIG_FILE);
-    
+
     FILE *cfg = fopen(config_path, "r");
     if (cfg == NULL) {
-        // Config file doesn't exist, create one with defaults
-        FILE *new_cfg = fopen(config_path, "w");
-        if (new_cfg != NULL) {
-            fprintf(new_cfg, "# PacFetch Configuration File\n");
-            fprintf(new_cfg, "default_package_manager = pacman\n");
-            fprintf(new_cfg, "use_sudo = 1\n");
-            fprintf(new_cfg, "install_flags = -S --needed\n");
-            fprintf(new_cfg, "remove_flags = -R\n");
-            fprintf(new_cfg, "upgrade_flags = -Syu\n");
-            fclose(new_cfg);
+        // Set default configuration
+        if (config->manager_count < MAX_MANAGERS) {
+            strcpy(config->managers[0].name, "pacman");
+            strcpy(config->managers[0].type, "official");
+            strcpy(config->managers[0].install_flags, "-S --needed");
+            strcpy(config->managers[0].remove_flags, "-R");
+            strcpy(config->managers[0].upgrade_flags, "-Syu");
+            config->managers[0].use_sudo = 1;
+            config->manager_count++;
         }
+        if (config->manager_count < MAX_MANAGERS) {
+            strcpy(config->managers[1].name, "yay");
+            strcpy(config->managers[1].type, "aur");
+            strcpy(config->managers[1].install_flags, "-S --needed");
+            strcpy(config->managers[1].remove_flags, "-R");
+            strcpy(config->managers[1].upgrade_flags, "-Syu");
+            config->managers[1].use_sudo = 0;
+            config->manager_count++;
+        }
+        strcpy(config->system_upgrade_manager, "yay");
         free(log_dir_path);
         return;
     }
-    
+
     char line[MAX_LINE_LEN];
+    char current_section[32] = "";
     while (fgets(line, MAX_LINE_LEN, cfg) != NULL) {
-        // Skip comments and empty lines
-        if (line[0] == '#' || line[0] == '\n') {
-            continue;
-        }
-        
-        char key[MAX_LINE_LEN];
-        char value[MAX_LINE_LEN];
-        
-        // Parse key-value pairs
-        if (sscanf(line, "%[^=]=%[^\n]", key, value) == 2) {
-            // Trim whitespace
-            char *k = key;
-            while (isspace(*k)) k++;
-            char *v = value;
-            while (isspace(*v)) v++;
-            
-            char *end = k + strlen(k) - 1;
-            while (end > k && isspace(*end)) *end-- = '\0';
-            end = v + strlen(v) - 1;
-            while (end > v && isspace(*end)) *end-- = '\0';
-            
-            if (strcmp(k, "default_package_manager") == 0) {
-                strncpy(config->default_package_manager, v, sizeof(config->default_package_manager) - 1);
-            } else if (strcmp(k, "use_sudo") == 0) {
-                config->use_sudo = atoi(v);
-            } else if (strcmp(k, "install_flags") == 0) {
-                strncpy(config->install_flags, v, sizeof(config->install_flags) - 1);
-            } else if (strcmp(k, "remove_flags") == 0) {
-                strncpy(config->remove_flags, v, sizeof(config->remove_flags) - 1);
-            } else if (strcmp(k, "upgrade_flags") == 0) {
-                strncpy(config->upgrade_flags, v, sizeof(config->upgrade_flags) - 1);
+        line[strcspn(line, "\n")] = 0;
+        if (line[0] == '[') {
+            sscanf(line, "[%31[^]]", current_section);
+        } else if (strlen(line) > 0 && line[0] != '#') {
+            char key[32], value[64];
+            if (sscanf(line, "%31[^=]=%63s", key, value) == 2) {
+                if (strcmp(current_section, "package_managers") == 0) {
+                    if (config->manager_count < MAX_MANAGERS) {
+                        strcpy(config->managers[config->manager_count].name, key);
+                        strcpy(config->managers[config->manager_count].type, value);
+                        config->manager_count++;
+                    }
+                } else if (strcmp(current_section, "default") == 0) {
+                    if (strcmp(key, "system_upgrade_manager") == 0) {
+                        strcpy(config->system_upgrade_manager, value);
+                    }
+                } else {
+                    for (int i = 0; i < config->manager_count; i++) {
+                        if (strcmp(config->managers[i].name, current_section) == 0) {
+                            if (strcmp(key, "install_flags") == 0) {
+                                strcpy(config->managers[i].install_flags, value);
+                            } else if (strcmp(key, "remove_flags") == 0) {
+                                strcpy(config->managers[i].remove_flags, value);
+                            } else if (strcmp(key, "upgrade_flags") == 0) {
+                                strcpy(config->managers[i].upgrade_flags, value);
+                            } else if (strcmp(key, "use_sudo") == 0) {
+                                config->managers[i].use_sudo = atoi(value);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
-    
     fclose(cfg);
     free(log_dir_path);
 }
@@ -674,48 +753,62 @@ char* sanitize_input(const char *input) {
     return sanitized;
 }
 
-void remove_package(int argc, char *argv[]) {
+void remove_package(int argc, char *argv[], PackfetchConfig *config, const char *specified_manager) {
     if (argc < 3) {
-        printf("Error: No package specified for removal\n");
+        printf("Error: No package specified\n");
         return;
     }
-    
-    if (!validate_package_name(argv[2])) {
-        printf("Error: Invalid package name '%s'\n", argv[2]);
+    char *package_name = argv[2];
+    if (!validate_package_name(package_name)) {
+        printf("Error: Invalid package name '%s'\n", package_name);
         return;
     }
-    
-    // Check if package is tracked by pacfetch
-    if (!check_if_installed(argv[2])) {
-        printf("Warning: Package %s is not tracked by PacFetch\n", argv[2]);
-        printf("Proceeding with removal anyway...\n");
-    }
-    
-    // Load configuration
-    PackfetchConfig config;
-    load_config(&config);
-    
-    // Remove the package using configured package manager
-    printf("Removing package %s...\n", argv[2]);
-    int result = execute_package_manager(config.default_package_manager, "remove", 
-                                       config.remove_flags, argv[2]);
-    
-if (result == 0) {
-        // Log the successful removal
-        char *command_str = get_command_string(argc, argv);
-        if (command_str != NULL) {
-            log_removal(argv[2], command_str);
-            free(command_str);
-        } else {
-            log_removal(argv[2], "unknown command");
-        }
-        printf("Removal of %s completed and logged.\n", argv[2]);
+
+    char *manager_to_use = NULL;
+    if (specified_manager) {
+        manager_to_use = (char *)specified_manager;
     } else {
-        printf("Failed to remove package %s\n", argv[2]);
-        printf("Try using 'sudo %s %s %s' manually\n", 
-               config.default_package_manager, 
-               config.remove_flags, argv[2]);
+        manager_to_use = get_installation_manager(package_name);
+        if (!manager_to_use) {
+            for (int i = 0; i < config->manager_count; i++) {
+                if (strcmp(config->managers[i].type, "official") == 0) {
+                    manager_to_use = config->managers[i].name;
+                    break;
+                }
+            }
+        }
     }
+
+    if (!manager_to_use) {
+        printf("Error: No suitable manager found\n");
+        return;
+    }
+
+    PackageManagerConfig *mgr_config = NULL;
+    for (int i = 0; i < config->manager_count; i++) {
+        if (strcmp(config->managers[i].name, manager_to_use) == 0) {
+            mgr_config = &config->managers[i];
+            break;
+        }
+    }
+    if (!mgr_config) {
+        printf("Error: Manager '%s' not configured\n", manager_to_use);
+        free(manager_to_use);
+        return;
+    }
+
+    int result = execute_package_manager(manager_to_use, "remove",
+                                         mgr_config->remove_flags, package_name,
+                                         mgr_config->use_sudo);
+    if (result == 0) {
+        char *command_str = get_command_string(argc, argv);
+        log_removal(package_name, command_str, manager_to_use);
+        if (command_str) free(command_str);
+        printf("Removed %s with %s\n", package_name, manager_to_use);
+    } else {
+        printf("Failed to remove %s\n", package_name);
+    }
+    if (!specified_manager && manager_to_use) free(manager_to_use);
 }
 
 void query_package(int argc, char *argv[]) {
@@ -944,85 +1037,57 @@ char* get_command_string(int argc, char *argv[]) {
     return cmd;
 }
 
-void log_installation(const char *package_name, const char *install_dir, const char *command_used) {
+void log_installation(const char *package_name, const char *install_dir, const char *command_used, const char *manager) {
     char *log_dir_path = get_log_dir();
-    if (log_dir_path == NULL) {
-        printf("Error: Failed to get log directory\n");
-        return;
-    }
-
     char log_path[MAX_PATH_LEN];
     char db_path[MAX_PATH_LEN];
     snprintf(log_path, MAX_PATH_LEN, "%s/%s", log_dir_path, LOG_FILE);
     snprintf(db_path, MAX_PATH_LEN, "%s/%s", log_dir_path, DB_FILE);
 
-    // Get current time
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
     char time_str[100];
     strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", t);
 
-    // Get package details
     PackageDetails details;
-    if (get_package_details(package_name, &details) != 0) {
-        printf("Warning: Failed to get package details for %s\n", package_name);
-        strcpy(details.version, "unknown");
-        details.size = 0;
-        details.dependency_count = 0;
-        strcpy(details.source, "unknown");
-    }
+    get_package_details(package_name, &details);
+    char *user = getlogin() ? getlogin() : "unknown";
 
-    // Get username
-    char *user = getlogin();
-    if (user == NULL) {
-        user = "unknown";
-    }
-
-    // Log to install_log.txt in CSV format
     FILE *log = fopen(log_path, "a");
-    if (log != NULL) {
+    if (log) {
         fprintf(log, "%s,installed,%s,%s,%s,%lld,%d,%s,%s\n",
                 time_str, package_name, details.version, details.source, details.size,
                 details.dependency_count, command_used, user);
         fclose(log);
-    } else {
-        printf("Warning: Failed to write to log file %s\n", log_path);
     }
 
-    // Update packages.db
     FILE *db = fopen(db_path, "a+");
-    if (db != NULL) {
+    if (db) {
         fseek(db, 0, SEEK_SET);
         char line[MAX_CMD_LEN];
         int exists = 0;
-
-        while (fgets(line, MAX_CMD_LEN, db) != NULL) {
+        while (fgets(line, MAX_CMD_LEN, db)) {
             char *pkg_name = strtok(line, ",");
-            if (pkg_name != NULL && strcmp(pkg_name, package_name) == 0) {
+            if (pkg_name && strcmp(pkg_name, package_name) == 0) {
                 exists = 1;
                 break;
             }
         }
-
         if (!exists) {
-            fprintf(db, "%s,%s,%s,%s,%s\n", package_name, time_str, install_dir, details.version, details.source);
+            fprintf(db, "%s,%s,%s,%s,%s,%s\n", package_name, time_str, install_dir, manager, details.version, details.source);
         } else {
             fclose(db);
             char temp_db_path[MAX_PATH_LEN];
             snprintf(temp_db_path, MAX_PATH_LEN, "%s/%s.tmp", log_dir_path, DB_FILE);
-
             FILE *db_read = fopen(db_path, "r");
             FILE *temp_db = fopen(temp_db_path, "w");
-
-            if (db_read != NULL && temp_db != NULL) {
-                char line[MAX_CMD_LEN];
-                char line_copy[MAX_CMD_LEN];
-
-                while (fgets(line, MAX_CMD_LEN, db_read) != NULL) {
+            if (db_read && temp_db) {
+                while (fgets(line, MAX_CMD_LEN, db_read)) {
+                    char line_copy[MAX_CMD_LEN];
                     strcpy(line_copy, line);
                     char *pkg_name = strtok(line_copy, ",");
-                    if (pkg_name != NULL && strcmp(pkg_name, package_name) == 0) {
-                        fprintf(temp_db, "%s,%s,%s,%s,%s\n", package_name, time_str, install_dir, details.version, details.source);
+                    if (pkg_name && strcmp(pkg_name, package_name) == 0) {
+                        fprintf(temp_db, "%s,%s,%s,%s,%s,%s\n", package_name, time_str, install_dir, manager, details.version, details.source);
                     } else {
                         fputs(line, temp_db);
                     }
@@ -1034,14 +1099,11 @@ void log_installation(const char *package_name, const char *install_dir, const c
             }
         }
         if (!exists) fclose(db);
-    } else {
-        printf("Warning: Failed to update package database %s\n", db_path);
     }
-
     free(log_dir_path);
 }
 
-void log_removal(const char *package_name, const char *command_used) {
+void log_removal(const char *package_name, const char *command_used, const char *manager) {
     char *log_dir_path = get_log_dir();
     if (log_dir_path == NULL) {
         printf("Error: Failed to get log directory\n");
@@ -1055,28 +1117,24 @@ void log_removal(const char *package_name, const char *command_used) {
     snprintf(db_path, MAX_PATH_LEN, "%s/%s", log_dir_path, DB_FILE);
     snprintf(temp_db_path, MAX_PATH_LEN, "%s/%s.tmp", log_dir_path, DB_FILE);
 
-    // Get current time
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
     char time_str[100];
     strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", t);
 
-    // Get username
     char *user = getlogin();
     if (user == NULL) {
         user = "unknown";
     }
 
-    // Log to install_log.txt in CSV format
     FILE *log = fopen(log_path, "a");
     if (log != NULL) {
-        fprintf(log, "%s,removed,%s,%s,%s\n", time_str, package_name, command_used, user);
+        fprintf(log, "%s,removed,%s,%s,%s,%s\n", time_str, package_name, command_used, user, manager);
         fclose(log);
     } else {
         printf("Warning: Failed to write to log file %s\n", log_path);
     }
 
-    // Remove entry from packages.db (unchanged)
     FILE *db = fopen(db_path, "r");
     FILE *temp_db = fopen(temp_db_path, "w");
 
@@ -1100,77 +1158,261 @@ void log_removal(const char *package_name, const char *command_used) {
     free(log_dir_path);
 }
 
-void upgrade_packages(int argc, char *argv[]) {
+
+// Fix for the upgrade_packages function to address the unused variable warning
+// void upgrade_packages(int argc, char *argv[], PackfetchConfig *config, const char *specified_manager) {
+//     char *log_dir_path = get_log_dir();
+//     if (!log_dir_path) {
+//         printf("Error: Failed to get log directory\n");
+//         return;
+//     }
+
+//     if (argc >= 3) {
+//         char *package_name = argv[2];
+//         if (!validate_package_name(package_name)) {
+//             printf("Error: Invalid package name '%s'\n", package_name);
+//             free(log_dir_path);
+//             return;
+//         }
+    
+//         char *manager_to_use = NULL;
+//         int manager_allocated = 0;
+//         if (specified_manager) {
+//             manager_to_use = (char *)specified_manager;
+//         } else {
+//             manager_to_use = get_installation_manager(package_name);
+//             if (manager_to_use) {
+//                 manager_allocated = 1;
+//             } else {
+//                 for (int i = 0; i < config->manager_count; i++) {
+//                     if (strcmp(config->managers[i].type, "official") == 0) {
+//                         manager_to_use = config->managers[i].name;
+//                         break;
+//                     }
+//                 }
+//             }
+//         }
+//         if (manager_to_use) {
+//             int manager_found = 0;
+//             for (int i = 0; i < config->manager_count; i++) {
+//                 if (strcmp(config->managers[i].name, manager_to_use) == 0) {
+//                     mgr_config = &config->managers[i];
+//                     manager_found = 1;
+//                     break;
+//                 }
+//             }
+//             if (!manager_found) {
+//                 printf("Warning: Manager '%s' invalid, using default\n", manager_to_use);
+//                 if (manager_allocated) free(manager_to_use);
+//                 manager_to_use = NULL;
+//             }
+//         }
+//         if (!manager_to_use) {
+//             for (int i = 0; i < config->manager_count; i++) {
+//                 if (strcmp(config->managers[i].type, "official") == 0) {
+//                     manager_to_use = config->managers[i].name;
+//                     mgr_config = &config->managers[i];
+//                     break;
+//                 }
+//             }
+//         }
+//         PackageManagerConfig *mgr_config = NULL;
+//         if (manager_to_use) {
+//             for (int i = 0; i < config->manager_count; i++) {
+//                 if (strcmp(config->managers[i].name, manager_to_use) == 0) {
+//                     mgr_config = &config->managers[i];
+//                     break;
+//                 }
+//             }
+//         }
+//         if (!mgr_config) {
+//             printf("Error: Manager '%s' not configured\n", manager_to_use);
+//             if (manager_allocated) free(manager_to_use);
+//             free(log_dir_path);
+//             return;
+//         }
+    
+//         int result = execute_package_manager(manager_to_use, "upgrade",
+//                                              mgr_config->install_flags, package_name,
+//                                              mgr_config->use_sudo);
+//         if (result == 0) {
+//             char *command_str = get_command_string(argc, argv);
+//             log_upgrade(package_name, command_str, manager_to_use);
+//             if (command_str) free(command_str);
+//             printf("Upgraded %s with %s\n", package_name, manager_to_use);
+//         } else {
+//             printf("Failed to upgrade %s\n", package_name);
+//         }
+//         if (manager_allocated) free(manager_to_use);
+//     } else {
+//         char *manager_to_use = config->system_upgrade_manager[0] ? config->system_upgrade_manager : NULL;
+//         if (!manager_to_use) {
+//             for (int i = 0; i < config->manager_count; i++) {
+//                 if (strcmp(config->managers[i].type, "aur") == 0) {
+//                     manager_to_use = config->managers[i].name;
+//                     break;
+//                 }
+//             }
+//             if (!manager_to_use) {
+//                 for (int i = 0; i < config->manager_count; i++) {
+//                     if (strcmp(config->managers[i].type, "official") == 0) {
+//                         manager_to_use = config->managers[i].name;
+//                         break;
+//                     }
+//                 }
+//             }
+//         }
+
+//         PackageManagerConfig *mgr_config = NULL;
+//         for (int i = 0; i < config->manager_count; i++) {
+//             if (strcmp(config->managers[i].name, manager_to_use) == 0) {
+//                 mgr_config = &config->managers[i];
+//                 break;
+//             }
+//         }
+//         if (!mgr_config) {
+//             printf("Error: No suitable manager for system upgrade\n");
+//             free(log_dir_path);
+//             return;
+//         }
+
+//         char cmd[MAX_CMD_LEN];
+//         snprintf(cmd, MAX_CMD_LEN, "%s%s %s", mgr_config->use_sudo ? "sudo " : "",
+//                  manager_to_use, mgr_config->upgrade_flags);
+//         system(cmd);
+//         char *command_str = get_command_string(argc, argv);
+//         log_system_upgrade(command_str ? command_str : "unknown command");
+//         if (command_str) free(command_str);
+//         printf("System upgrade completed with %s\n", manager_to_use);
+//     }
+//     free(log_dir_path);
+// }
+
+void upgrade_packages(int argc, char *argv[], PackfetchConfig *config, const char *specified_manager) {
     char *log_dir_path = get_log_dir();
-    if (log_dir_path == NULL) {
+    if (!log_dir_path) {
         printf("Error: Failed to get log directory\n");
         return;
     }
-    
-    PackfetchConfig config;
-    load_config(&config);
-    
+
+    // Declare variables at the function scope
+    char *manager_to_use = NULL;
+    int manager_allocated = 0;
+    PackageManagerConfig *mgr_config = NULL;
+
     if (argc >= 3) {
-        if (!validate_package_name(argv[2])) {
-            printf("Error: Invalid package name '%s'\n", argv[2]);
+        char *package_name = argv[2];
+        if (!validate_package_name(package_name)) {
+            printf("Error: Invalid package name '%s'\n", package_name);
             free(log_dir_path);
             return;
         }
-        
-        printf("Upgrading package: %s\n", argv[2]);
-        if (!check_if_installed(argv[2])) {
-            printf("Warning: Package %s is not tracked by PacFetch\n", argv[2]);
-            printf("Proceeding with upgrade anyway...\n");
-        }
-        
-        int result = execute_package_manager(config.default_package_manager, "upgrade", 
-                                           config.upgrade_flags, argv[2]);
-        if (result != 0) {
-            printf("Failed to upgrade with %s, trying yay...\n", config.default_package_manager);
-            result = execute_package_manager("yay", "upgrade", config.upgrade_flags, argv[2]);
-            if (result != 0) {
-                printf("Failed to upgrade package %s.\n", argv[2]);
-                free(log_dir_path);
-                return;
+
+        // Determine the package manager to use
+        if (specified_manager) {
+            manager_to_use = (char *)specified_manager;
+        } else {
+            manager_to_use = get_installation_manager(package_name);
+            if (manager_to_use) {
+                manager_allocated = 1;
             }
         }
-        
-        char *command_str = get_command_string(argc, argv);
-        if (command_str != NULL) {
-            log_upgrade(argv[2], command_str);
-            free(command_str);
-        } else {
-            log_upgrade(argv[2], "unknown command");
+
+        // Validate manager_to_use and set mgr_config
+        if (manager_to_use) {
+            for (int i = 0; i < config->manager_count; i++) {
+                if (strcmp(config->managers[i].name, manager_to_use) == 0) {
+                    mgr_config = &config->managers[i];
+                    break;
+                }
+            }
+            if (!mgr_config) {
+                printf("Warning: Manager '%s' invalid, using default\n", manager_to_use);
+                if (manager_allocated) free(manager_to_use);
+                manager_to_use = NULL;
+                manager_allocated = 0;
+            }
         }
-        printf("Upgrade of %s completed and successfully logged.\n", argv[2]);
+
+        // Fallback to the first official manager if necessary
+        if (!manager_to_use) {
+            for (int i = 0; i < config->manager_count; i++) {
+                if (strcmp(config->managers[i].type, "official") == 0) {
+                    manager_to_use = config->managers[i].name;
+                    mgr_config = &config->managers[i];
+                    break;
+                }
+            }
+        }
+
+        // Check if a valid manager configuration was found
+        if (!mgr_config) {
+            printf("Error: No suitable manager found\n");
+            if (manager_allocated) free(manager_to_use);
+            free(log_dir_path);
+            return;
+        }
+
+        // Execute the package manager
+        int result = execute_package_manager(manager_to_use, "upgrade",
+                                             mgr_config->install_flags, package_name,
+                                             mgr_config->use_sudo);
+        if (result == 0) {
+            char *command_str = get_command_string(argc, argv);
+            log_upgrade(package_name, command_str, manager_to_use);
+            if (command_str) free(command_str);
+            printf("Upgraded %s with %s\n", package_name, manager_to_use);
+        } else {
+            printf("Failed to upgrade %s\n", package_name);
+        }
+        if (manager_allocated) free(manager_to_use);
     } else {
-        printf("Upgrading all packages...\n");
+        // System upgrade path
+        manager_to_use = config->system_upgrade_manager[0] ? config->system_upgrade_manager : NULL;
+        if (!manager_to_use) {
+            for (int i = 0; i < config->manager_count; i++) {
+                if (strcmp(config->managers[i].type, "aur") == 0) {
+                    manager_to_use = config->managers[i].name;
+                    break;
+                }
+            }
+            if (!manager_to_use) {
+                for (int i = 0; i < config->manager_count; i++) {
+                    if (strcmp(config->managers[i].type, "official") == 0) {
+                        manager_to_use = config->managers[i].name;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Set mgr_config based on manager_to_use
+        if (manager_to_use) {
+            for (int i = 0; i < config->manager_count; i++) {
+                if (strcmp(config->managers[i].name, manager_to_use) == 0) {
+                    mgr_config = &config->managers[i];
+                    break;
+                }
+            }
+        }
+
+        if (!mgr_config) {
+            printf("Error: No suitable manager for system upgrade\n");
+            free(log_dir_path);
+            return;
+        }
+
+        // Execute system upgrade
         char cmd[MAX_CMD_LEN];
-        if (config.use_sudo) {
-            snprintf(cmd, MAX_CMD_LEN, "sudo %s %s", 
-                    config.default_package_manager, config.upgrade_flags);
-        } else {
-            snprintf(cmd, MAX_CMD_LEN, "%s %s", 
-                    config.default_package_manager, config.upgrade_flags);
-        }
+        snprintf(cmd, MAX_CMD_LEN, "%s%s %s", mgr_config->use_sudo ? "sudo " : "",
+                 manager_to_use, mgr_config->upgrade_flags);
         system(cmd);
-        
-        if (strcmp(config.default_package_manager, "yay") != 0) {
-            printf("Checking AUR packages for updates...\n");
-            snprintf(cmd, MAX_CMD_LEN, "yay -Sua");
-            system(cmd);
-        }
-        
         char *command_str = get_command_string(argc, argv);
-        if (command_str != NULL) {
-            log_system_upgrade(command_str);
-            free(command_str);
-        } else {
-            log_system_upgrade("unknown command");
-        }
-        printf("System upgrade completed and logged.\n");
+        log_system_upgrade(command_str ? command_str : "unknown command");
+        if (command_str) free(command_str);
+        printf("System upgrade completed with %s\n", manager_to_use);
     }
-    
+
     free(log_dir_path);
 }
 
@@ -1181,8 +1423,12 @@ void search_packages(int argc, char *argv[]) {
     }
     PackfetchConfig config;
     load_config(&config);
+    if (config.system_upgrade_manager[0] == '\0') {
+        printf("Error: No system upgrade manager configured\n");
+        return;
+    }
     char cmd[MAX_CMD_LEN];
-    snprintf(cmd, MAX_CMD_LEN, "%s -Ss %s", config.default_package_manager, argv[2]);
+    snprintf(cmd, MAX_CMD_LEN, "%s -Ss %s", config.system_upgrade_manager, argv[2]);
     printf("Searching for '%s'...\n", argv[2]);
     system(cmd);
 }
@@ -1218,7 +1464,7 @@ void help(void) {
     printf("PacFetch - A wrapper for pacman/yay with installation tracking\n\n");
     printf("Usage:\n");
     printf("  pacfetch [OPTION] [ARGUMENTS]\n\n");
-    printf("Options:\n");
+    printf("  --manager=NAME               Specify package manager (e.g., pacman, yay)\n");
     printf("  -S, --sync PACKAGE           Install a package\n");
     printf("  -R, --remove PACKAGE         Remove a package\n");
     printf("  -Q, --query [PACKAGE]        Query all tracked packages or a specific package's history\n");
@@ -1267,7 +1513,7 @@ char* get_log_dir(void) {
     return buffer;
 }
 
-void log_upgrade(const char *package_name, const char *command_used) {
+void log_upgrade(const char *package_name, const char *command_used, const char *manager) {
     char *log_dir_path = get_log_dir();
     if (log_dir_path == NULL) {
         printf("Error: Failed to get log directory\n");
@@ -1279,37 +1525,33 @@ void log_upgrade(const char *package_name, const char *command_used) {
     snprintf(log_path, MAX_PATH_LEN, "%s/%s", log_dir_path, LOG_FILE);
     snprintf(db_path, MAX_PATH_LEN, "%s/%s", log_dir_path, DB_FILE);
 
-    // Get current time
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
     char time_str[100];
     strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", t);
 
-    // Get package details
     PackageDetails details;
     if (get_package_details(package_name, &details) != 0) {
         printf("Warning: Failed to get package details for %s\n", package_name);
+        free(log_dir_path);
         return;
     }
 
-    // Get username
     char *user = getlogin();
     if (user == NULL) {
         user = "unknown";
     }
 
-    // Log to install_log.txt in CSV format
     FILE *log = fopen(log_path, "a");
     if (log != NULL) {
-        fprintf(log, "%s,upgraded,%s,%s,%s,%lld,%d,%s,%s\n",
-                time_str, package_name, details.version, details.source, details.size,
-                details.dependency_count, command_used, user);
+        fprintf(log, "%s,upgraded,%s,%s,%s,%lld,%d,%s,%s,%s\n",
+            time_str, package_name, details.version, details.source, details.size,
+            details.dependency_count, command_used, user, manager);
         fclose(log);
     } else {
         printf("Warning: Failed to write to log file %s\n", log_path);
     }
 
-    // Update packages.db (unchanged)
     if (check_if_installed(package_name)) {
         char temp_db_path[MAX_PATH_LEN];
         snprintf(temp_db_path, MAX_PATH_LEN, "%s/%s.tmp", log_dir_path, DB_FILE);
@@ -1327,8 +1569,10 @@ void log_upgrade(const char *package_name, const char *command_used) {
                 if (pkg_name != NULL && strcmp(pkg_name, package_name) == 0) {
                     char *install_date = strtok(NULL, ",");
                     char *install_dir = strtok(NULL, ",");
-                    fprintf(temp_db, "%s,%s,%s,%s,%s\n",
-                            package_name, install_date, install_dir, details.version, details.source);
+                    char *existing_manager = strtok(NULL, ",");
+                    fprintf(temp_db, "%s,%s,%s,%s,%s,%s\n",
+                            package_name, install_date, install_dir, existing_manager,
+                            details.version, details.source);
                 } else {
                     fputs(line, temp_db);
                 }
